@@ -1,0 +1,5 @@
+# ignore
+*.zip
+target/
+.idea
+project
