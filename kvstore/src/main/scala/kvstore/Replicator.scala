@@ -24,6 +24,10 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
+  context.system.eventStream.subscribe(self, classOf[Replicate])
+
+  context.system.scheduler.schedule(0.milliseconds, 100.milliseconds)(sendSnapshots(replica))
+
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
@@ -39,7 +43,30 @@ class Replicator(val replica: ActorRef) extends Actor {
   
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
+    case replicate: Replicate => {
+      val seq = nextSeq
+      acks = insert(seq, (sender, replicate))
+      replica ! Snapshot(replicate.key, replicate.valueOption, seq)
+    }
+    case snapshotAck: SnapshotAck => {
+      acks.get(snapshotAck.seq).foreach(entry => entry._1 ! Replicated(entry._2.key, entry._2.id))
+      acks = remove(snapshotAck.seq)
+    }
     case _ =>
   }
+
+  private def insert(key: Long, value: (ActorRef, Replicate)): Map[Long, (ActorRef, Replicate)] = {
+    acks + (key -> value)
+  }
+
+  private def remove(key: Long): Map[Long, (ActorRef, Replicate)] = {
+    acks - key
+  }
+
+  private def sendSnapshots(replica: ActorRef) = {
+    acks.foreach(entry => replica ! Snapshot(entry._2._2.key, entry._2._2.valueOption, entry._1))
+  }
+
+  override def postStop(): Unit = context.system.eventStream.unsubscribe(self)
 
 }
