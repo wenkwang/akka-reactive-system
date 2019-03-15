@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, ActorSystem, OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated}
+import akka.actor.{Actor, ActorRef, ActorSystem, OneForOneStrategy, PoisonPill, Props, ReceiveTimeout, SupervisorStrategy, Terminated}
 import kvstore.Arbiter._
 
 import scala.collection.immutable.Queue
@@ -48,8 +48,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   var _seqCounter = 0L
   def nextSeq() = {
+    val ret = _seqCounter
     _seqCounter += 1
+    ret
   }
+
+  var acks = Map.empty[Long, (ActorRef, Persist)]
+
+  override val supervisorStrategy = OneForOneStrategy() {
+    case _: Exception => SupervisorStrategy.restart
+  }
+
+  var persistence = context.actorOf(persistenceProps)
+  context.watch(persistence)
 
   arbiter ! Join
 
@@ -61,17 +72,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Insert(key, value, id) => {
-      kv = insert(key, value)
-      sender ! OperationAck(id)
-      context.system.eventStream.publish(Replicate(key, Some(value), id))
+      kv = insert(kv, key, value)
+      acks = insert(acks, id, (sender, Persist(key, Some(value), id)))
+      persistence ! Persist(key, Some(value), id)
+      context.setReceiveTimeout(1.second)
     }
     case Remove(key, id) => {
-      kv = remove(key)
-      sender ! OperationAck(id)
-      context.system.eventStream.publish(Replicate(key, None, id))
+      kv = remove(kv, key)
+      acks = insert(acks, id, (sender, Persist(key, None, id)))
+      persistence ! Persist(key, None, id)
+      context.setReceiveTimeout(1.second)
     }
     case Get(key, id) => {
-      sender ! GetResult(key, get(key), id)
+      sender ! GetResult(key, kv.get(key), id)
     }
     case Replicas(replicas) => {
       val (replicasToAdd, replicasToRemove) = parseOutTargetReplicas(replicas)
@@ -79,48 +92,67 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       removeReplicas(replicasToRemove)
     }
     case Replicated =>
+    case Persisted(key, id) =>
+//      println(s"Persisted: key-$key, id-$id")
+      val entry = acks(id)
+      acks = remove(acks, id)
+      if (acks.isEmpty) context.setReceiveTimeout(Duration.Undefined)
+      else context.setReceiveTimeout(1.second)
+      entry._1 ! OperationAck(id)
+      context.system.eventStream.publish(Replicate(entry._2.key, entry._2.valueOption, entry._2.id))
+    case ReceiveTimeout =>
+      acks.foreach(entry => persistence ! entry._2._2)
+      context.setReceiveTimeout(1.second)
+
   }
 
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
     case Get(key, id) => {
-      val result = get(key)
+      val result = kv.get(key)
       sender ! GetResult(key, result, id)
     }
-    case Snapshot(key, valueOption, seq) if seq == _seqCounter => {
+    case snapshot: Snapshot if snapshot.seq == _seqCounter => {
 //      println(s"== seq: $seq, seqCounter: ${_seqCounter}, value: $valueOption")
-      persist(key, valueOption)
+      localPersist(snapshot.key, snapshot.valueOption)
       nextSeq()
-      sender ! SnapshotAck(key, seq)
+      val persist = Persist(snapshot.key, snapshot.valueOption, snapshot.seq)
+      acks = insert(acks, snapshot.seq, (sender, persist))
+      persistence ! persist
+      context.setReceiveTimeout(100.milliseconds)
     }
-    case Snapshot(key, _, seq) if seq < _seqCounter => {
+    case snapshot: Snapshot if snapshot.seq < _seqCounter => {
 //      println(s"< seq: $seq, seqCounter: ${_seqCounter}")
-      sender ! SnapshotAck(key, seq)
+      sender ! SnapshotAck(snapshot.key, snapshot.seq)
     }
+    case Persisted(key, seq) =>
+      val entry = acks(seq)
+      acks = remove(acks, seq)
+      if (acks.isEmpty) context.setReceiveTimeout(Duration.Undefined)
+      else context.setReceiveTimeout(100.milliseconds)
+      entry._1 ! SnapshotAck(key, seq)
+    case ReceiveTimeout =>
+      acks.foreach(entry => persistence ! entry._2._2)
+      context.setReceiveTimeout(100.milliseconds)
   }
 
-  private def insert(key: String, value: String): Map[String, String]  = {
+  private def insert[A, B](map: Map[A, B], key: A, value: B): Map[A, B]  = {
 //    println(s"insert ($key, $value)")
 //    println(kv.mkString("|"))
-    kv + (key -> value)
+    map + (key -> value)
   }
 
-  private def remove(key: String): Map[String, String] = {
+  private def remove[A, B](map: Map[A, B], key: A): Map[A, B] = {
 //    println(s"remove $key")
 //    println(kv.mkString("|"))
-    kv - key
+    if (map.contains(key)) map - key
+    else map
   }
 
-  private def get(key: String): Option[String] = {
-//    println(s"get $key")
-//    println(kv.mkString("|"))
-    kv.get(key)
-  }
-
-  private def persist(key: String, valueOption: Option[String]) = {
+  private def localPersist(key: String, valueOption: Option[String]) = {
     valueOption match {
-      case Some(x) => kv = insert(key, x)
-      case None => kv = remove(key)
+      case Some(x) => kv = insert(kv, key, x)
+      case None => kv = remove(kv, key)
     }
   }
 
