@@ -24,10 +24,6 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
-  context.system.eventStream.subscribe(self, classOf[Replicate])
-
-  context.system.scheduler.schedule(0.milliseconds, 100.milliseconds)(sendSnapshots(replica))
-
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
@@ -40,16 +36,23 @@ class Replicator(val replica: ActorRef) extends Actor {
     ret
   }
 
+  context.system.eventStream.subscribe(self, classOf[Replicate])
+  context.system.scheduler.schedule(0.milliseconds, 100.milliseconds)(sendSnapshots)
+
   
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case replicate: Replicate => {
+//      println(s"Replicator - Receive Replicate: key-${replicate.key}, value-${replicate.valueOption}")
+//      println(s"Replicator: ${self}, Replica: ${replica}")
       val seq = nextSeq
       acks = insert(seq, (sender, replicate))
       replica ! Snapshot(replicate.key, replicate.valueOption, seq)
     }
     case snapshotAck: SnapshotAck => {
-      acks.get(snapshotAck.seq).foreach(entry => entry._1 ! Replicated(entry._2.key, entry._2.id))
+//      println(s"Replicator - Receive SnapshotACK: key-${snapshotAck.key}, value-${snapshotAck.seq}")
+//      println(s"Replicator - acks: ${acks.mkString("|")}")
+      acks.get(snapshotAck.seq).foreach(entry => context.system.eventStream.publish(Replicated(entry._2.key, entry._2.id)))
       acks = remove(snapshotAck.seq)
     }
     case _ =>
@@ -60,10 +63,12 @@ class Replicator(val replica: ActorRef) extends Actor {
   }
 
   private def remove(key: Long): Map[Long, (ActorRef, Replicate)] = {
-    acks - key
+    if (acks.contains(key)) acks - key
+    else acks
   }
 
-  private def sendSnapshots(replica: ActorRef) = {
+  private def sendSnapshots() = {
+//    println(acks.mkString("|"))
     acks.foreach(entry => replica ! Snapshot(entry._2._2.key, entry._2._2.valueOption, entry._1))
   }
 

@@ -38,5 +38,23 @@ trait Step1_PrimarySpec
     client.getAndVerify("k1")
   }
 
+//  test("Step1-case3: Primary should behave like a standard map") {
+//    val arbiter = TestProbe()
+//    val primary = system.actorOf(Replica.props(arbiter.ref, Persistence.props(flaky = false)), "step1-case3-primary")
+//    val client = session(primary)
+//
+//    arbiter.expectMsg(Join)
+//    arbiter.send(primary, JoinedPrimary)
+//
+//    client.getAndVerify("k1")
+//    client.setAcked("k1", "v1")
+//    client.getAndVerify("k1")
+//    client.getAndVerify("k2")
+//    client.setAcked("k2", "v2")
+//    client.getAndVerify("k2")
+//    client.removeAcked("k1")
+//    client.getAndVerify("k1")
+//  }
+
   
 }

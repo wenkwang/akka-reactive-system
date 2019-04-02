@@ -39,21 +39,25 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
-  
+
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
+  var replicateACKS = Map.empty[Long, (ActorRef, Int)]
+
+  var replicatedACKS = Map.empty[Long, Set[ActorRef]]
+
   var _seqCounter = 0L
-  def nextSeq() = {
+  def nextSeq(): Long = {
     val ret = _seqCounter
     _seqCounter += 1
     ret
   }
 
-  var acks = Map.empty[Long, (ActorRef, Persist)]
+  var persistACKs = Map.empty[Long, (ActorRef, Persist)]
 
   override val supervisorStrategy = OneForOneStrategy() {
     case _: Exception => SupervisorStrategy.restart
@@ -64,22 +68,29 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   arbiter ! Join
 
+  context.system.scheduler.schedule(0.milliseconds, 100.milliseconds)(sendPersists)
+
   def receive = {
-    case JoinedPrimary   => context.become(leader)
+    case JoinedPrimary   => {
+      context.system.eventStream.subscribe(self, classOf[Replicated])
+      context.become(leader)
+    }
     case JoinedSecondary => context.become(replica)
   }
 
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Insert(key, value, id) => {
+//      println(s"Receive Insert: key-$key, value-$value, id-$id")
       kv = insert(kv, key, value)
-      acks = insert(acks, id, (sender, Persist(key, Some(value), id)))
+      persistACKs = insert(persistACKs, id, (sender, Persist(key, Some(value), id)))
       persistence ! Persist(key, Some(value), id)
       context.setReceiveTimeout(1.second)
     }
     case Remove(key, id) => {
+//      println(s"Receive Remove: key-$key, id-$id")
       kv = remove(kv, key)
-      acks = insert(acks, id, (sender, Persist(key, None, id)))
+      persistACKs = insert(persistACKs, id, (sender, Persist(key, None, id)))
       persistence ! Persist(key, None, id)
       context.setReceiveTimeout(1.second)
     }
@@ -87,23 +98,57 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       sender ! GetResult(key, kv.get(key), id)
     }
     case Replicas(replicas) => {
+//      println(s"Receive Replicas: ${replicas.mkString("|")}, size-${secondaries.size}, secondaries: ${secondaries.mkString("|")}, replicas: ${replicas.mkString("|")}")
       val (replicasToAdd, replicasToRemove) = parseOutTargetReplicas(replicas)
       addReplicas(replicasToAdd)
       removeReplicas(replicasToRemove)
+//      println(s"Secondaries: size-${secondaries.size}")
     }
-    case Replicated =>
     case Persisted(key, id) =>
-//      println(s"Persisted: key-$key, id-$id")
-      val entry = acks(id)
-      acks = remove(acks, id)
-      if (acks.isEmpty) context.setReceiveTimeout(Duration.Undefined)
-      else context.setReceiveTimeout(1.second)
-      entry._1 ! OperationAck(id)
-      context.system.eventStream.publish(Replicate(entry._2.key, entry._2.valueOption, entry._2.id))
+//      println(s"Receive Persisted: key-$key, id-$id")
+      val entry = persistACKs(id)
+      persistACKs = remove(persistACKs, id)
+//      println(s"Secondaries: size-${secondaries.size}")
+      if (secondaries.isEmpty) {
+        entry._1 ! OperationAck(id)
+        context.setReceiveTimeout(Duration.Undefined)
+      } else {
+        val replicate = Replicate(entry._2.key, entry._2.valueOption, entry._2.id)
+        replicateACKS = insert(replicateACKS, id, (entry._1, 0))
+        replicatedACKS = insert(replicatedACKS, id, Set.empty[ActorRef])
+        context.system.eventStream.publish(replicate)
+      }
+    case Replicated(key, id) => {
+      //      println(s"Receive Replicated: key-$key, id-$id")
+      replicateACKS.get(id) match {
+        case Some(entry) => {
+          val count = entry._2 + 1
+          val client = entry._1
+          if (count >= secondaries.size) {
+            client! OperationAck(id)
+            replicateACKS = remove(replicateACKS, id)
+            replicatedACKS = remove(replicatedACKS, id)
+            context.setReceiveTimeout(Duration.Undefined)
+          } else {
+            replicateACKS = insert(replicateACKS, id, (client, count))
+            val set = replicatedACKS(id) + sender
+            replicatedACKS = insert(replicatedACKS, id, set)
+          }
+        }
+        case None =>
+      }
+    }
     case ReceiveTimeout =>
-      acks.foreach(entry => persistence ! entry._2._2)
-      context.setReceiveTimeout(1.second)
-
+      //      println("ReceiveTimeout...")
+      //      println("acks: " + persistACKs.mkString("|"))
+      //      println("replicates: " + replicateACKS.mkString("|"))
+      //      println("secondaries: " + secondaries.mkString("|"))
+      persistACKs.foreach(entry => entry._2._1 ! OperationFailed(entry._1))
+      replicateACKS.foreach(entry => entry._2._1 ! OperationFailed(entry._1))
+      persistACKs = Map.empty[Long, (ActorRef, Persist)]
+      replicateACKS = Map.empty[Long, (ActorRef, Int)]
+      replicatedACKS = Map.empty[Long, Set[ActorRef]]
+      context.setReceiveTimeout(Duration.Undefined)
   }
 
   /* TODO Behavior for the replica role. */
@@ -113,27 +158,27 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       sender ! GetResult(key, result, id)
     }
     case snapshot: Snapshot if snapshot.seq == _seqCounter => {
-//      println(s"== seq: $seq, seqCounter: ${_seqCounter}, value: $valueOption")
+//      println(s"[Replica] Receive Snapshot(=): key-${snapshot.key}, value-${snapshot.valueOption}")
       localPersist(snapshot.key, snapshot.valueOption)
       nextSeq()
       val persist = Persist(snapshot.key, snapshot.valueOption, snapshot.seq)
-      acks = insert(acks, snapshot.seq, (sender, persist))
+      persistACKs = insert(persistACKs, snapshot.seq, (sender, persist))
       persistence ! persist
-      context.setReceiveTimeout(100.milliseconds)
+//      context.setReceiveTimeout(100.milliseconds)
     }
     case snapshot: Snapshot if snapshot.seq < _seqCounter => {
-//      println(s"< seq: $seq, seqCounter: ${_seqCounter}")
+//      println(s"[Replica] Receive Snapshot (<): key-${snapshot.key}, value-${snapshot.valueOption}")
       sender ! SnapshotAck(snapshot.key, snapshot.seq)
     }
     case Persisted(key, seq) =>
-      val entry = acks(seq)
-      acks = remove(acks, seq)
-      if (acks.isEmpty) context.setReceiveTimeout(Duration.Undefined)
-      else context.setReceiveTimeout(100.milliseconds)
+//      println(s"[Replica] Receive Persisted: key-$key, value-$seq")
+      val entry = persistACKs(seq)
+      persistACKs = remove(persistACKs, seq)
+//      if (acks.isEmpty) context.setReceiveTimeout(Duration.Undefined)
+//      else context.setReceiveTimeout(1.second)
       entry._1 ! SnapshotAck(key, seq)
-    case ReceiveTimeout =>
-      acks.foreach(entry => persistence ! entry._2._2)
-      context.setReceiveTimeout(100.milliseconds)
+    case _ =>
+//      println(s"[Replica] Receive unexpected message." )
   }
 
   private def insert[A, B](map: Map[A, B], key: A, value: B): Map[A, B]  = {
@@ -157,7 +202,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   private def parseOutTargetReplicas(replicas: Set[ActorRef]): (Set[ActorRef], Set[ActorRef]) = {
-    (replicas.diff(secondaries.keySet), secondaries.keySet.diff(replicas))
+    (replicas.filterNot(_ == self).diff(secondaries.keySet), secondaries.keySet.diff(replicas))
   }
 
   private def addReplicas(replicasToAdd: Set[ActorRef]) = {
@@ -172,7 +217,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   private def forwardUpdateEvents(replicator: ActorRef) = {
-    kv.foreach(entry => replicator.forward(Replicate(entry._1, Some(entry._2), -1)))
+    var seq = 0L
+    kv.foreach(entry => {
+      replicator.forward(Replicate(entry._1, Some(entry._2), seq))
+      seq += 1
+    })
   }
 
   private def removeReplicas(replicasToRemove: Set[ActorRef]) = {
@@ -187,7 +236,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           case None => map
         }
       })
+      replicatedACKS.foreach { entry =>
+        val id = entry._1
+        if (entry._2 == replicators) {
+          replicateACKS(id)._1 ! OperationAck(id)
+          replicateACKS = remove(replicateACKS, id)
+          replicatedACKS = remove(replicatedACKS, id)
+        }
+      }
     }
   }
+
+  private def sendPersists() = {
+    persistACKs.foreach(entry => persistence ! entry._2._2)
+  }
+
 }
 
